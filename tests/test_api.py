@@ -1250,3 +1250,135 @@ def test_hit_test_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/hole-clearance 孔洞最大内接圆（钻孔选点，只读）
+# ---------------------------------------------------------------------------
+
+def test_hole_clearance_square_hole(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    r = client.post(f"/paths/{pid}/hole-clearance", json={"precision": 0.01})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["precision"] == 0.01
+    assert body["hole_count"] == 1
+    assert body["cells_used"] > 0
+    hole = body["holes"][0]
+    assert hole["original_index"] == 1
+    assert hole["role"] == "hole" and hole["depth"] == 1
+    assert hole["center"] == {"x": 5.0, "y": 5.0}
+    assert hole["radius"] == 3.0
+    assert body["skipped_contours"] == [
+        {"original_index": 0, "role": "outer", "reason": "outer"}]
+
+
+def test_hole_clearance_avoids_island(client):
+    # 孔 2..18 内有偏心岛 3..9：圆心被推到对角远端，半径受岛边界约束
+    pid = _mk(client, "M0,0h20v20h-20Z M2,2h16v16h-16Z M3,3h6v6h-6Z")
+    body = client.post(f"/paths/{pid}/hole-clearance",
+                       json={"precision": 0.01}).json()
+    hole = body["holes"][0]
+    cx, cy = hole["center"]["x"], hole["center"]["y"]
+    assert not (3.0 < cx < 9.0 and 3.0 < cy < 9.0)
+    # 理论最优半径 18 - (18+9*sqrt(2))/(1+sqrt(2)) ≈ 5.2721
+    assert abs(hole["radius"] - 5.272077938) < 0.01 + 1e-6
+
+
+def test_hole_clearance_concave_hole(client):
+    # L 形凹孔：包围盒中心 (10,10) 在凹角上不可用，搜索仍收敛到最优
+    pid = _mk(client,
+              "M0,0h30v30h-30Z M2,2 L18,2 L18,10 L10,10 L10,18 L2,18 Z")
+    body = client.post(f"/paths/{pid}/hole-clearance",
+                       json={"precision": 0.01}).json()
+    hole = body["holes"][0]
+    assert hole["radius"] > 4.6  # 大于臂宽一半的朴素估计 4
+    assert hole["center"] != {"x": 10.0, "y": 10.0}
+
+
+def test_hole_clearance_no_valid_holes_empty_array(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    body = client.post(f"/paths/{pid}/hole-clearance",
+                       json={"precision": 0.1}).json()
+    assert body["holes"] == []
+    assert body["hole_count"] == 0
+    assert body["cells_used"] == 0
+    assert body["skipped_contours"] == [
+        {"original_index": 0, "role": "outer", "reason": "outer"}]
+
+
+def test_hole_clearance_skips_open_and_degenerate(client):
+    d = "M0,0h10v10h-10Z M2,2h6v6h-6Z M20,0 L30,0 L30,10 M5,5 L8,5 L5,5 Z"
+    pid = _mk(client, d)
+    body = client.post(f"/paths/{pid}/hole-clearance",
+                       json={"precision": 0.1}).json()
+    assert body["hole_count"] == 1
+    assert {(s["original_index"], s["reason"])
+            for s in body["skipped_contours"]} == {
+                (0, "outer"), (2, "open"), (3, "degenerate")}
+
+
+def test_hole_clearance_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/hole-clearance",
+                       json={"precision": 0.01}).status_code == 200
+    # 即时分析不写库，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/hole-clearance",
+                     json={"precision": 0.01}).json()
+    b2 = client.post(f"/paths/{pid}/hole-clearance",
+                     json={"precision": 0.01}).json()
+    assert b1 == b2
+
+
+def test_hole_clearance_404(client):
+    assert client.post("/paths/999999/hole-clearance",
+                       json={"precision": 0.1}).status_code == 404
+
+
+def test_hole_clearance_id_path_validation(client):
+    assert client.post("/paths/x/hole-clearance",
+                       json={"precision": 0.1}).status_code == 422
+    assert client.post("/paths/0/hole-clearance",
+                       json={"precision": 0.1}).status_code == 404
+
+
+def test_hole_clearance_422_on_invalid_precision(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    url = f"/paths/{pid}/hole-clearance"
+    assert client.post(url, json={"precision": 0}).status_code == 422
+    assert client.post(url, json={"precision": -3}).status_code == 422
+    assert client.post(url, json={}).status_code == 422
+    assert client.post(url, json={"precision": "x"}).status_code == 422
+    assert client.post(url, json={"precision": "nan"}).status_code == 422
+    # 超大数（JSON 解析为 Infinity）也必须是 422 而不是 500
+    r = client.post(url,
+                    content='{"precision": 1e999}',
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_hole_clearance_422_when_grid_budget_exceeded(client):
+    # 细长孔 + 极小精度：20000 个网格单元内无法收敛 -> 422
+    pid = _mk(client,
+              "M0,0h1000v1000h-1000Z M10,10 L990,10 L990,11 L10,11 Z")
+    r = client.post(f"/paths/{pid}/hole-clearance", json={"precision": 1e-9})
+    assert r.status_code == 422
+    assert "20000" in r.json()["detail"]
+
+
+def test_hole_clearance_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/hole-clearance",
+                    json={"precision": 0.1})
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+

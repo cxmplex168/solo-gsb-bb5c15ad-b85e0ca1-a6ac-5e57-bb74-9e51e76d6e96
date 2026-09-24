@@ -10,6 +10,7 @@
     POST /paths/{id}/tabs        外环微桥布置（周长等分扇区 + 拐角余量/不重叠约束）
     POST /paths/{id}/intersections 只读：加工前轮廓交叉清单（自交/互交/接触/共线重叠）
     POST /paths/{id}/hit-test    只读：批量点命中测试（inside/outside/boundary）
+    POST /paths/{id}/hole-clearance 只读：逐孔洞最大内接圆圆心（钻孔选点）
     POST /paths/compare          两条已存路径的版本差异审计（指纹匹配 + 三类变更）
     GET  /paths/{id}             查询原始路径、规范化结果及边界警告
     GET  /healthz                存活/就绪探针
@@ -33,6 +34,7 @@ from .clearance import check_clearance
 from .cutplan import compute_cut_plan
 from .diff import compare_normalized
 from .hittest import MAX_HIT_POINTS, hit_test_points
+from .holeclearance import compute_hole_clearance
 from .intersections import find_intersections
 from .metrics import compute_metrics
 from .scanlines import MAX_SCANLINES, compute_scanlines
@@ -48,10 +50,11 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.8.0",
+    version="1.9.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
                 "支持填充面积与面积质心分析、水平扫描线填充区间、"
-                "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置"
+                "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置、"
+                "孔洞最大内接圆钻孔选点"
                 "与两条已存路径的版本差异审计。",
     lifespan=lifespan,
 )
@@ -186,6 +189,19 @@ class HitTestIn(BaseModel):
         max_length=MAX_HIT_POINTS,
         description=f"待查询坐标点列表（至少 1 个，最多 {MAX_HIT_POINTS} 个，"
                     "按输入顺序返回判定）")
+
+
+class HoleClearanceIn(BaseModel):
+    precision: float = Field(..., gt=0,
+                             description="最大内接圆半径的逼近精度（>0）；"
+                                         "返回半径与真实最大半径之差不超过该值")
+
+    @field_validator("precision")
+    @classmethod
+    def _finite(cls, v: float) -> float:
+        if not math.isfinite(v):
+            raise ValueError("precision 必须是有限数值")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -467,4 +483,25 @@ def hit_test(path_id: int,
     points = [(p.x, p.y) for p in payload.points]
     result = hit_test_points(contours, points=points,
                              fill_rule=row["fill_rule"])
+    return {"id": path_id, "fill_rule": row["fill_rule"], **result}
+
+
+@app.post("/paths/{path_id}/hole-clearance")
+def hole_clearance(path_id: int,
+                   payload: HoleClearanceIn,
+                   conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    try:
+        result = compute_hole_clearance(contours, precision=payload.precision)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=str(exc))
     return {"id": path_id, "fill_rule": row["fill_rule"], **result}

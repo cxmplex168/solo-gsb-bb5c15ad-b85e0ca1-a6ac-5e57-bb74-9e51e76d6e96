@@ -19,7 +19,10 @@
 的类型、交点坐标及原始轮廓与边索引）、
 **`POST /paths/{id}/hit-test` 批量点命中测试**
 （最多 500 个有限坐标点，逐边判定 boundary 优先，其余按保存的
-evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参与）
+evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参与）、
+**`POST /paths/{id}/hole-clearance` 孔洞最大内接圆钻孔选点**
+（逐有效孔洞在孔内、避开直属岛的可行区域中按距离上界优先细分网格，
+在给定精度内逼近最大内接圆圆心与半径）
 与 **`POST /paths/compare` 版本差异审计**，
 按几何指纹稳定匹配两条已存路径并给出 added / removed / modified 三组差异。启动后自动建表，
 可直接调用。
@@ -40,8 +43,9 @@ evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
 │   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
 │   ├── hittest.py      # 批量点命中测试：boundary 优先，evenodd 交叉奇偶 / nonzero 有向边绕数
+│   ├── holeclearance.py # 孔洞最大内接圆：距离上界优先网格细分、直属岛避让、预算超限报错
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（262 个）
+├── tests/             # pytest 单元 + API 端到端测试（290 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -666,6 +670,75 @@ curl -s -X POST localhost:8000/paths/1/hit-test \
 - 路径不存在返回 `404`；`points` 缺失/为空/超过 500 个、坐标缺失/非数字/
   非有限数返回 `422`；已存路径无法解析返回 `422`。
 
+### `POST /paths/{id}/hole-clearance` — 孔洞最大内接圆（钻孔选点，只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（复用与 metrics / clearance /
+scanlines 相同的曲线细分折线，无需事先调用 normalize，**不写数据库**），
+为每个**有效孔洞**（`role == "hole"`，闭合且非退化）寻找孔内最大内接圆的
+圆心，供钻孔选点：
+
+- **可行区域**：候选圆心必须严格位于孔洞内部，且不在任何**直属岛**
+  （`parent_original_index` 指向该孔洞的深度偶数 `outer` 岛）内部；
+- **半径定义**：候选点的可用半径为到**孔洞边界**与**各直属岛边界**的
+  最短欧氏距离（在曲线细分折线上逐边计算）；
+- **搜索方式**：不取包围盒中心（凹孔或偏心岛会使其失效），而是在孔洞
+  包围盒上按**距离上界优先**细分网格（polylabel 式）——优先队列按
+  `格心最小边界距离 + 半格对角线` 的上界出队，上界仍可能把当前最优半径
+  提升超过 `precision` 时四分子格，整格落在孔外/岛内则剪枝；
+- **收敛保证**：返回半径 `r` 满足 `r* - precision <= r <= r*`（`r*` 为
+  细分折线上的真实最大半径）；
+- **预算上限**：单次请求全部孔洞合计最多评估 **20000** 个网格单元，
+  预算耗尽仍未达到 `precision` 时返回 `422`（请增大 `precision`）；
+- **跳过规则**：外环（`outer`）、开放轮廓（`open`）与退化轮廓
+  （`degenerate`）一律跳过并列入 `skipped_contours`；没有任何有效孔洞时
+  `holes` 为空数组、`cells_used` 为 0。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `precision` | number | 最大半径的逼近精度，必须 **> 0** 且为有限数（NaN/无穷/非数字返回 `422`） |
+
+```bash
+# 外方 0..20 含孔 2..18，孔内有偏心岛 3..9：圆心被推到对角远端
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h20v20h-20Z M2,2h16v16h-16Z M3,3h6v6h-6Z"
+}'
+curl -s -X POST localhost:8000/paths/1/hole-clearance \
+  -H 'Content-Type: application/json' \
+  -d '{"precision": 0.01}'
+```
+
+响应（服务地址 <http://localhost:8000>）：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "precision": 0.01,
+  "hole_count": 1,
+  "cells_used": 125,
+  "holes": [
+    {"original_index": 1, "role": "hole", "depth": 1,
+     "center": {"x": 12.7265625, "y": 12.7265625},
+     "radius": 5.270155229}
+  ],
+  "skipped_contours": [
+    {"original_index": 0, "role": "outer", "reason": "outer"},
+    {"original_index": 2, "role": "outer", "reason": "outer"}
+  ]
+}
+```
+
+- `holes[]`：按 `original_index` 升序，每项含 `center: {x, y}`（可行圆心）
+  与 `radius`（到孔洞/岛边界的最短距离）；上例理论最优半径
+  `18-(18+9√2)/(1+√2) ≈ 5.2721`，误差在 `precision=0.01` 之内；
+- `cells_used`：本次请求实际评估的网格单元数（全部孔洞合计，上限 20000）；
+- `skipped_contours[]`：未参与的轮廓及 `reason`
+  （`outer` / `open` / `degenerate`）；
+- 路径不存在返回 `404`；`precision` 缺失/≤0/非有限数、网格预算耗尽未收敛、
+  已存路径无法解析（历史脏数据）均返回 `422`。
+
 ### `GET /paths/{id}` — 查询原始路径、规范化结果与警告
 
 未规范化时 `normalized` 为 `null`；已规范化时包含 `d`、`contours`、
@@ -811,7 +884,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 262 passed
+pytest -q          # 290 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -854,7 +927,14 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 boundary、空路径全 outside、曲线细分顶点命中、凹多边形半开边顶点规则、
 按输入顺序回显索引与坐标、两种填充规则差异、最多 500 点边界（恰好 500
 放行、501 拒绝）、空列表/缺字段/非数字/NaN/Infinity/1e999 返回 422、
-确定性与只读不落库、404/非法 id/脏数据 422 等。
+确定性与只读不落库、404/非法 id/脏数据 422 等；
+孔洞最大内接圆的方孔精确圆心半径、长条孔短边一半半径、L 形凹孔不退化为
+包围盒中心、粗细两种精度下半径误差均在 precision 内、圆弧孔细分折线
+apothem、偏心岛把圆心推离且半径等于到孔/岛边界最短距离（独立复核）、
+孔中岛与岛中孔各自求解、同级双孔按原始索引升序、无有效孔洞返回空数组、
+开放与退化子路径跳过、两种填充规则一致、跨调用确定性、非法 precision
+422、细长孔极小精度触发 20000 网格预算 422、只读不落库、404/非法 id/
+脏数据 422 等。
 
 ## 数据存储
 
