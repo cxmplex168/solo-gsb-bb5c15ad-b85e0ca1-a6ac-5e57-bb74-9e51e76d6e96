@@ -9,6 +9,9 @@
 （在整体包围盒内等间距取水平扫描线，按层级交替合并外环/孔/岛，输出逐行填充区间）、
 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
 （按细分线段计算任意两轮廓边界的最小欧氏距离）、
+**`POST /paths/{id}/hole-clearance` 孔洞最大内接圆选点**
+（在孔内且避开直属岛的自由空间上按距离上界优先细分网格，
+于给定精度内逼近最大内接圆心，供钻孔选点）、
 **`POST /paths/{id}/cut-plan` 闭合轮廓加工计划**
 （后代先加工、每轮贪心选取距刀头最近的细分顶点入刀，输出加工顺序与逐段空走距离）、
 **`POST /paths/{id}/tabs` 外环微桥布置**
@@ -36,12 +39,13 @@ evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参
 │   ├── metrics.py     # 填充面积与面积质心：外/孔/岛交替计入，基于细分多边形
 │   ├── scanlines.py   # 水平扫描线填充区间：半开边求交、按层级交替合并，逐行输出
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
+│   ├── holeclearance.py # 孔洞最大内接圆选点：扫描线候选 + 距离上界优先的四叉树细分分支限界
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
 │   ├── tabs.py        # 外环微桥布置：周长等分扇区、拐角余量/互不重叠约束、逐桥段坐标与弧长
 │   ├── intersections.py # 加工前轮廓交叉清单：非相邻边自交/子路径互交、交叉/接触/共线重叠分类合并
 │   ├── hittest.py      # 批量点命中测试：boundary 优先，evenodd 交叉奇偶 / nonzero 有向边绕数
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（262 个）
+├── tests/             # pytest 单元 + API 端到端测试（290 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -345,6 +349,84 @@ curl -s -X POST localhost:8000/paths/1/clearance \
   -d '{"min_distance": 2, "include_open": true}'
 # -> conflict_count=1，b.role="open"，distance=1.0，hole_parent=false
 ```
+
+### `POST /paths/{id}/hole-clearance` — 孔洞最大内接圆选点（只读，供钻孔选点）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（复用与 metrics / clearance
+相同的曲线细分折线，无需事先调用 normalize，**不写数据库**），为每个
+**有效孔洞**（`role == "hole"`，闭合且非退化）寻找孔内**最大内接圆**
+的圆心，供钻孔选点：
+
+- 候选圆心必须位于**孔洞内部**且不在任何**直属岛**（以该孔为直接
+  parent 的外环，深度 = 孔深 + 1）内部；圆半径取圆心到孔洞边界与
+  直属岛边界的**最短距离**（细分折线逐边的点-线段距离）；
+- 搜索在孔洞包围盒上按**距离上界优先**做网格细分：起始网格把包围盒
+  划分为接近正方形的单元，每个单元以「单元中心有符号净空 + 单元半
+  对角线长」作为可达半径上界（有符号距离 1-Lipschitz），大根堆优先
+  细分上界最大的单元（四等分）；水平/垂直扫描线的自由区间中点提供
+  初始候选——**凹孔或偏心岛导致包围盒中心落在自由空间之外或显著
+  偏优时，仍能找到孔内最优**；
+- 当全局上界与当前最优半径之差不超过 `precision` 时收敛：返回半径
+  与真实最大半径之差不超过 `precision`；
+- 全部孔洞合计最多处理 **20000** 个网格单元，预算耗尽仍未达到精度
+  返回 `422`（请增大 `precision`）；
+- **开放轮廓**与**退化轮廓**跳过并列入 `skipped_contours`；
+  没有有效孔洞时 `holes` 为空数组、`hole_count` 为 0。
+
+请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `precision` | number | 半径逼近精度，必须 **> 0** 且为有限数（NaN/无穷/非数字返回 `422`） |
+
+```bash
+# 外方 0..20 含内孔 4..16：最大内接圆半径 6，圆心 (10,10)
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h20v20h-20Z M4,4h12v12h-12Z"
+}'
+curl -s -X POST localhost:8000/paths/1/hole-clearance \
+  -H 'Content-Type: application/json' \
+  -d '{"precision": 0.001}'
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "precision": 0.001,
+  "hole_count": 1,
+  "cells_used": 181,
+  "holes": [
+    {"original_index": 1, "role": "hole", "depth": 1,
+     "center": {"x": 10.0, "y": 10.0}, "radius": 6.0, "cells_used": 181}
+  ],
+  "skipped_contours": []
+}
+```
+
+偏心岛示例（孔 `0..20` 内 `2..4` 的小岛把最优圆心推离包围盒中心：
+包围盒中心 `(10,10)` 的净空只有 `6√2 ≈ 8.485`，实际最优圆心
+`≈ (10.6274, 10.6274)`、半径 `≈ 9.3726`）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M-10,-10h40v40h-40Z M0,0h20v20h-20Z M2,2h2v2h-2Z"
+}'
+curl -s -X POST localhost:8000/paths/1/hole-clearance \
+  -H 'Content-Type: application/json' \
+  -d '{"precision": 0.001}'
+# -> "center": {"x": 10.627441406, "y": 10.627441406}, "radius": 9.372558594
+```
+
+- `holes[]` 按 `original_index` 升序，每项含 `center`（`{x, y}`）、
+  `radius`、`depth` 与本孔消耗的网格单元数 `cells_used`；
+  顶层 `cells_used` 为全部孔洞合计；
+- 孔中岛内的孔（深度 3、5 …）同样作为独立孔洞求解，其自由空间为
+  自身内部（只扣除各自的直属岛）；
+- 路径不存在返回 `404`；`precision` 缺失/≤0/非有限数、网格单元
+  超过 20000 仍未达精度、已存路径无法解析均返回 `422`。
 
 ### `POST /paths/{id}/cut-plan` — 闭合轮廓加工计划（只读）
 
@@ -811,7 +893,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 262 passed
+pytest -q          # 290 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -830,6 +912,12 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 同级孔与隔层 island 不标记、**距离等于阈值通过**、开放轮廓默认跳过与
 `include_open` 纳入、退化轮廓始终跳过、曲线细分、包围盒剔除、结果确定性与
 只读不落库、404/非法参数 422 等；
+孔洞最大内接圆选点的方孔精确圆心半径、半径与真实最大值之差不超过
+precision、偏心岛推离包围盒中心、凹孔（L 形）包围盒中心失效仍收敛、
+居中岛四对称最优、孔-岛-孔嵌套各自求解、同级多孔按原始索引升序、
+曲线孔细分近似、无有效孔洞空数组、开放/退化跳过、仅直属岛约束、
+两种填充规则一致、网格预算共享与超限 422、细长走廊精度放宽后收敛、
+非法 precision/max_cells 422、跨调用确定性与只读不落库、404/脏数据 422 等；
 闭合轮廓加工计划的后代先加工（外-孔、外-孔-岛三层、同级孔全部先于父轮廓）、
 每轮最近细分顶点入刀与刀头停在入刀点的链式空走距离、距离相等时按原始索引、
 顶点序号决胜、曲线细分顶点入刀、开放与退化跳过、无有效轮廓空计划、
